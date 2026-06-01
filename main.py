@@ -4,6 +4,8 @@ from email.mime.text import MIMEText
 from datetime import datetime
 import os
 import sys
+import json
+import re
 
 # ---------- 1. 获取风电热点论文 ----------
 def fetch_hot_papers(query, limit=10, year=""):
@@ -65,27 +67,106 @@ def ai_summarize_paper(title, abstract):
         print(f"AI总结失败: {e}")
         return ""
 
+
+# ----------  新增翻译函数 ----------
+def translate_papers_batch(papers):
+    """
+    使用 Claude 批量翻译论文标题和摘要。
+    返回一个列表，每个元素是包含 'title_zh', 'abstract_zh' 的字典。
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("未配置 ANTHROPIC_API_KEY，跳过翻译。")
+        return [{"title_zh": "", "abstract_zh": ""} for _ in papers]
+
+    # 构建待翻译的内容，用序号分隔，方便解析
+    items = []
+    for i, p in enumerate(papers):
+        title = p.get("title", "")
+        abstract = (p.get("abstract") or "")[:500]  # 限制长度避免 token 爆炸
+        items.append({
+            "index": i,
+            "title": title,
+            "abstract": abstract
+        })
+
+    # 构造提示词，要求返回严格的 JSON 数组
+    prompt = "请将以下风电领域论文的标题和摘要翻译成中文。\n"
+    for item in items:
+        prompt += f"\n[{item['index']}]\n标题: {item['title']}\n摘要: {item['abstract']}\n"
+    prompt += "\n请返回一个 JSON 数组，每个元素包含 index, title_zh, abstract_zh，直接返回 JSON 不要加任何解释。\n示例：[{\"index\": 0, \"title_zh\": \"...\", \"abstract_zh\": \"...\"}, ...]"
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 3000,  # 根据论文数量调整
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    try:
+        r = requests.post("https://api.anthropic.com/v1/messages",
+                           headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
+        content = r.json()["content"][0]["text"]
+        # 提取 JSON 部分（可能被包裹在 ``` 里）
+        json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', content, re.DOTALL)
+        if json_match:
+            content = json_match.group(1)
+        translations = json.loads(content)
+        # 按 index 排序后提取
+        result = [{"title_zh": "", "abstract_zh": ""} for _ in papers]
+        for t in translations:
+            idx = t.get("index")
+            if idx is not None and idx < len(result):
+                result[idx]["title_zh"] = t.get("title_zh", "")
+                result[idx]["abstract_zh"] = t.get("abstract_zh", "")
+        return result
+    except Exception as e:
+        print(f"批量翻译失败: {e}")
+        # 失败时返回空翻译，不影响主流程
+        return [{"title_zh": "", "abstract_zh": ""} for _ in papers]
+        
 # ---------- 3. 格式化邮件内容 ----------
-def build_email_body(papers, use_ai=False):
+def build_email_body(papers, translations=None, use_ai_summary=False):
     lines = [f"📬 风电热点论文日报 - {datetime.now().strftime('%Y-%m-%d')}\n"]
     lines.append(f"共检索到 {len(papers)} 篇高引用论文\n")
-    for i, p in enumerate(papers, 1):
-        title = p.get("title", "无标题")
+    for i, p in enumerate(papers):
+        title_en = p.get("title", "无标题")
         url = p.get("url", "")
-        abstract = (p.get("abstract") or "无摘要")[:200].replace("\n", " ")
+        abstract_en = (p.get("abstract") or "无摘要")[:300].replace("\n", " ")
         citation = p.get("citationCount", 0)
         pub_date = p.get("publicationDate") or "未知"
+
+        # 获取翻译内容
+        title_zh = ""
+        abstract_zh = ""
+        if translations and i < len(translations):
+            title_zh = translations[i].get("title_zh", "")
+            abstract_zh = translations[i].get("abstract_zh", "")
+
         lines.append(f"{'='*40}")
-        lines.append(f"📌 第{i}篇 | 引用量：{citation} | 发表：{pub_date}")
-        lines.append(f"📄 标题：{title}")
+        lines.append(f"📌 第{i+1}篇 | 引用量：{citation} | 发表：{pub_date}")
+        lines.append(f"📄 英文标题：{title_en}")
+        if title_zh:
+            lines.append(f"📄 中文标题：{title_zh}")
         lines.append(f"🔗 链接：{url}")
-        # 如果启用AI总结且摘要存在
-        if use_ai and abstract:
-            summary = ai_summarize_paper(title, abstract)
+
+        # AI 一句话总结（如果启用）
+        if use_ai_summary and abstract_en:
+            summary = ai_summarize_paper(title_en, abstract_en)
             if summary:
                 lines.append(f"🤖 AI一句话：{summary}")
-        lines.append(f"📝 摘要：{abstract}...\n")
+
+        lines.append(f"📝 英文摘要：{abstract_en}...")
+        if abstract_zh:
+            lines.append(f"📝 中文摘要：{abstract_zh}...")
+        lines.append("")
     return "\n".join(lines)
+    
 
 # ---------- 4. 发送邮件 ----------
 def send_email(content, subject_prefix="风电热点论文"):
@@ -118,18 +199,21 @@ def send_email(content, subject_prefix="风电热点论文"):
 
 # ---------- 5. 主流程 ----------
 if __name__ == "__main__":
-    # 关键词可根据需要调整
     query = '"wind energy" OR "wind turbine" OR "wind power"'
-    # 是否启用AI总结（通过环境变量控制，默认不启用）
     use_ai = os.environ.get("USE_AI", "false").lower() == "true"
-    
+    translate_mode = os.environ.get("TRANSLATE_MODE", "false").lower() == "true"
+
     print(f"开始检索: {query}")
-    papers = fetch_hot_papers(query, limit=10, year="2026")  # 只获取2026年论文以体现热度
+    papers = fetch_hot_papers(query, limit=10, year="2026")
     if not papers:
-        print("未检索到论文，可能是API限制或网络问题。")
-        # 发送一个空报告邮件
         send_email("今日未获取到风电热点论文，请检查脚本日志。", "风电论文日报-错误")
         sys.exit(0)
-    
-    body = build_email_body(papers, use_ai=use_ai)
+
+    # 翻译流程
+    translations = None
+    if translate_mode:
+        print("正在进行批量翻译...")
+        translations = translate_papers_batch(papers)
+
+    body = build_email_body(papers, translations=translations, use_ai_summary=use_ai)
     send_email(body)
