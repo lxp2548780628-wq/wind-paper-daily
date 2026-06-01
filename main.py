@@ -6,8 +6,10 @@ import json
 import re
 from email.mime.text import MIMEText
 from datetime import datetime
+from openai import OpenAI
 import os
 import sys
+
 
 # ---------- 1. 获取风电热点论文（带 API Key 和指数退避） ----------
 def fetch_hot_papers(query, limit=10, year=""):
@@ -51,13 +53,20 @@ def fetch_hot_papers(query, limit=10, year=""):
             time.sleep(10)
     return []
 
-# ---------- 2. 批量翻译（使用 Claude） ----------
+# ---------- 2. 批量翻译（使用 deepseek） ----------
 def translate_papers_batch(papers):
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    """
+    使用 DeepSeek 批量翻译论文标题和摘要。
+    返回列表，每个元素含 'title_zh', 'abstract_zh'
+    """
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
-        print("未配置 ANTHROPIC_API_KEY，跳过翻译。")
+        print("未配置 DEEPSEEK_API_KEY，跳过翻译。")
         return [{"title_zh": "", "abstract_zh": ""} for _ in papers]
 
+    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+
+    # 构建待翻译项
     items = []
     for i, p in enumerate(papers):
         title = p.get("title", "")
@@ -69,23 +78,15 @@ def translate_papers_batch(papers):
         prompt += f"\n[{item['index']}]\n标题: {item['title']}\n摘要: {item['abstract']}\n"
     prompt += "\n请返回一个 JSON 数组，每个元素包含 index, title_zh, abstract_zh，直接返回 JSON 不要加任何解释。\n示例：[{\"index\": 0, \"title_zh\": \"...\", \"abstract_zh\": \"...\"}, ...]"
 
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    }
-    payload = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 3000,
-        "messages": [{"role": "user", "content": prompt}]
-    }
-
     try:
-        r = requests.post("https://api.anthropic.com/v1/messages",
-                           headers=headers, json=payload, timeout=60)
-        r.raise_for_status()
-        content = r.json()["content"][0]["text"]
-        # 提取 JSON
+        response = client.chat.completions.create(
+            model="deepseek-chat",      # 也可用 "deepseek-reasoner" 但 chat 就够了
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=3000
+        )
+        content = response.choices[0].message.content
+        # 提取 JSON 部分
         json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', content, re.DOTALL)
         if json_match:
             content = json_match.group(1)
@@ -98,30 +99,24 @@ def translate_papers_batch(papers):
                 result[idx]["abstract_zh"] = t.get("abstract_zh", "")
         return result
     except Exception as e:
-        print(f"批量翻译失败: {e}")
+        print(f"DeepSeek 翻译失败: {e}")
         return [{"title_zh": "", "abstract_zh": ""} for _ in papers]
 
 # ---------- 3. 一句话总结（可选） ----------
 def ai_summarize_paper(title, abstract):
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key or not abstract:
         return ""
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    }
+    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     prompt = f"请用中文一句话总结下面风电领域论文的核心贡献，不要超过50个字。\n标题：{title}\n摘要：{abstract[:500]}"
-    payload = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": prompt}]
-    }
     try:
-        r = requests.post("https://api.anthropic.com/v1/messages",
-                           headers=headers, json=payload, timeout=20)
-        r.raise_for_status()
-        return r.json()["content"][0]["text"].strip()
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=100
+        )
+        return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"AI总结失败: {e}")
         return ""
