@@ -85,23 +85,24 @@ def fetch_all_papers(queries, limit_per_query=30, year_start="2024"):
     return all_papers
 
 # ---------- 2. 通过 OpenAlex 获取期刊影响因子（2yr_mean_citedness） ----------
-def get_journal_impact_fact(issn_list):
+def get_journal_impact_factor(issn_list):
     """
     输入 ISSN 列表，返回 dict: { issn: { 'name': ..., 'if': ... } }
+    使用 OpenAlex API 获取期刊的 2 年平均引用次数（类似影响因子）
     """
     if not issn_list:
         return {}
-    # OpenAlex 的 sources 端点支持用 ISSN 批量过滤
+
     filters = "issn:" + "|".join(issn_list)
     params = {
         "filter": filters,
-        "per_page": 200,       # 一次最多 200
+        "per_page": 200,
         "select": "issn,display_name,summary_stats"
     }
     print(f"📊 查询 OpenAlex 期刊指标，ISSN 数量: {len(issn_list)}")
     try:
         resp = requests.get(OPENALEX_SOURCES_URL, params=params, timeout=30)
-        resp.raise_f_status()
+        resp.raise_for_status()
         data = resp.json()
         results = data.get("results", [])
         if_dict = {}
@@ -109,11 +110,9 @@ def get_journal_impact_fact(issn_list):
             issn_array = src.get("issn", [])
             if not issn_array:
                 continue
-            # 取第一个 ISSN
             issn_val = issn_array[0]
             name = src.get("display_name", "Unknown")
             stats = src.get("summary_stats", {})
-            # 2yr_mean_citedness 类似于影响因子，若无则用 h-index 或 0
             impact = stats.get("2yr_mean_citedness", 0)
             if_dict[issn_val] = {
                 "name": name,
