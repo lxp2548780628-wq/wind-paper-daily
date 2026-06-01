@@ -19,24 +19,38 @@ BATCH_TRANSLATE_SIZE = 5           # 每批翻译的论文数（避免 token 超
 
 # ---------- 1. 获取风电论文（按最新日期） ----------
 def fetch_papers(query, limit=MAX_PAPERS_TO_FETCH):
+    """
+    尝试用 API Key 访问，如果 403 则回退到匿名访问。
+    """
     api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
-    headers = {}
-    if api_key:
-        headers["x-api-key"] = api_key
+    # 准备两种请求头
+    headers_with_key = {"x-api-key": api_key} if api_key else {}
+    headers_anonymous = {}
+
+    # 首先用 Key 尝试（如果有）
+    current_headers = headers_with_key if api_key else headers_anonymous
+    using_key = bool(api_key)
 
     params = {
         "query": query,
         "limit": limit,
-        "sort": "publicationDate",   # 按最新发表排序
+        "sort": "publicationDate",
         "fields": "title,url,abstract,publicationDate,externalIds,journal"
     }
 
-    print(f"🔍 Semantic Scholar 请求: limit={limit}, query={query}")
-    for i in range(5):
+    print(f"🔑 当前模式: {'使用 API Key' if using_key else '匿名访问'}")
+
+    for attempt in range(5):
         try:
-            resp = requests.get(SEMANTIC_SCHOLAR_URL, params=params, headers=headers, timeout=30)
+            resp = requests.get(SEMANTIC_SCHOLAR_URL, params=params, headers=current_headers, timeout=30)
+            # 如果使用 Key 且返回 403，可能是 Key 无效，立即降级
+            if using_key and resp.status_code == 403:
+                print("⚠️ 使用 API Key 时收到 403，Key 可能无效，回退到匿名访问。")
+                current_headers = headers_anonymous
+                using_key = False
+                continue  # 立即用匿名方式重试本次循环
             if resp.status_code == 429:
-                wait = (2 ** i) * 5 + random.uniform(0, 5)
+                wait = (2 ** attempt) * 5 + random.uniform(0, 5)
                 print(f"⏳ 429 限流，等待 {wait:.1f}s ...")
                 time.sleep(wait)
                 continue
@@ -46,7 +60,7 @@ def fetch_papers(query, limit=MAX_PAPERS_TO_FETCH):
             print(f"✅ 获取到 {len(papers)} 篇论文")
             return papers
         except Exception as e:
-            print(f"❌ 请求失败 {i+1}/5: {e}")
+            print(f"❌ 请求失败 (尝试 {attempt+1}/5): {e}")
             time.sleep(10)
     return []
 
