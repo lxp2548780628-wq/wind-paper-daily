@@ -31,4 +31,5 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           USE_AI: ${{ secrets.USE_AI }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TRANSLATE_MODE: ${{ secrets.TRANSLATE_MODE }}
         run: python main.py
