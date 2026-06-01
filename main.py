@@ -18,54 +18,74 @@ TOP_N_PAPERS = 30                  # 最终推送前 30 篇
 BATCH_TRANSLATE_SIZE = 5           # 每批翻译的论文数（避免 token 超限）
 
 # ---------- 1. 获取风电论文（按最新日期） ----------
-def fetch_papers(query, limit=MAX_PAPERS_TO_FETCH):
+def fetch_all_papers(queries, limit_per_query=30, year_start="2024"):
     """
-    尝试用 API Key 访问，如果 403 则回退到匿名访问。
+    对多个简单关键词依次搜索，合并去重。
+    limit_per_query: 每个查询获取的论文数（避免单次过多被限）
+    year_start: 只取该年份及之后的论文
     """
     api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
-    # 准备两种请求头
-    headers_with_key = {"x-api-key": api_key} if api_key else {}
-    headers_anonymous = {}
-
-    # 首先用 Key 尝试（如果有）
-    current_headers = headers_with_key if api_key else headers_anonymous
+    headers = {"x-api-key": api_key} if api_key else {}
     using_key = bool(api_key)
+    if not using_key:
+        print("🔑 无 API Key，使用匿名访问（可能较慢）")
 
-    params = {
-        "query": query,
-        "limit": limit,
-        "sort": "publicationDate",
-        "fields": "title,url,abstract,publicationDate,externalIds,journal"
-    }
+    all_papers = []
+    seen_ids = set()
 
-    print(f"🔑 当前模式: {'使用 API Key' if using_key else '匿名访问'}")
+    for q in queries:
+        print(f"\n🔍 搜索: '{q}'")
+        params = {
+            "query": q,
+            "limit": limit_per_query,
+            "sort": "publicationDate",
+            # 字段包含期刊、外部 ID 等
+            "fields": "title,url,abstract,publicationDate,externalIds,journal,paperId",
+            # 年份过滤：只取最近2-3年
+            "year": f"{year_start}-"
+        }
 
-    for attempt in range(5):
-        try:
-            resp = requests.get(SEMANTIC_SCHOLAR_URL, params=params, headers=current_headers, timeout=30)
-            # 如果使用 Key 且返回 403，可能是 Key 无效，立即降级
-            if using_key and resp.status_code == 403:
-                print("⚠️ 使用 API Key 时收到 403，Key 可能无效，回退到匿名访问。")
-                current_headers = headers_anonymous
-                using_key = False
-                continue  # 立即用匿名方式重试本次循环
-            if resp.status_code == 429:
-                wait = (2 ** attempt) * 5 + random.uniform(0, 5)
-                print(f"⏳ 429 限流，等待 {wait:.1f}s ...")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            papers = data.get("data", [])
-            print(f"✅ 获取到 {len(papers)} 篇论文")
-            return papers
-        except Exception as e:
-            print(f"❌ 请求失败 (尝试 {attempt+1}/5): {e}")
-            time.sleep(10)
-    return []
+        got_results = False
+        for attempt in range(5):
+            try:
+                resp = requests.get(SEMANTIC_SCHOLAR_URL, params=params, headers=headers, timeout=30)
+                if using_key and resp.status_code == 403:
+                    print("⚠️ API Key 被拒，回退至匿名")
+                    headers = {}
+                    using_key = False
+                    continue
+                if resp.status_code == 429:
+                    wait = (2 ** attempt) * 5 + random.uniform(0, 5)
+                    print(f"⏳ 429 限流，等待 {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                papers = data.get("data", [])
+                new_papers = 0
+                for p in papers:
+                    pid = p.get("paperId")
+                    if pid and pid not in seen_ids:
+                        seen_ids.add(pid)
+                        all_papers.append(p)
+                        new_papers += 1
+                print(f"   ✅ 获取 {len(papers)} 篇，其中新论文 {new_papers} 篇")
+                got_results = True
+                break
+            except Exception as e:
+                print(f"   ❌ 请求错误 (尝试 {attempt+1}): {e}")
+                time.sleep(10)
+
+        if not got_results:
+            print(f"   ⚠️ 跳过查询 '{q}'，未获取到结果")
+        # 每个关键词之间稍作停顿，避免触发限流
+        time.sleep(1)
+
+    print(f"\n📦 总计获取去重论文 {len(all_papers)} 篇")
+    return all_papers
 
 # ---------- 2. 通过 OpenAlex 获取期刊影响因子（2yr_mean_citedness） ----------
-def get_journal_impact_factor(issn_list):
+def get_journal_impact_fact(issn_list):
     """
     输入 ISSN 列表，返回 dict: { issn: { 'name': ..., 'if': ... } }
     """
@@ -81,7 +101,7 @@ def get_journal_impact_factor(issn_list):
     print(f"📊 查询 OpenAlex 期刊指标，ISSN 数量: {len(issn_list)}")
     try:
         resp = requests.get(OPENALEX_SOURCES_URL, params=params, timeout=30)
-        resp.raise_for_status()
+        resp.raise_f_status()
         data = resp.json()
         results = data.get("results", [])
         if_dict = {}
@@ -255,7 +275,7 @@ def send_email(content):
         return
 
     msg = MIMEText(content, "plain", "utf-8")
-    msg["Subject"] = f"风电高IF论文日报 {datetime.now().strftime('%Y-%m-%d')}"
+    msg["Subject"] = f"风电高IF论文日报 (2024-至今) {datetime.now().strftime('%Y-%m-%d')}"
     msg["From"] = sender
     msg["To"] = receiver
 
@@ -271,18 +291,24 @@ def send_email(content):
 
 # ---------- 7. 主流程 ----------
 if __name__ == "__main__":
+    SEARCH_QUERIES = [
+        "wind energy",
+        "wind turbine",
+        "wind farm",
+        "offshore wind",
+        "wind turbine wake",
+        "wind turbine blade",
+        "wind turbine CFD",
+        "wind resource assessment",
+        "wind turbine layout optimization",
+        "wind turbine structure"
+    ]
     # 更全面的风电关键词
-    query = (
-        '"wind turbine" OR "wind farm" OR "wind energy" OR '
-        '"offshore wind" OR "onshore wind" OR "wind power" OR '
-        '"wind turbine layout optimization" OR "wind turbine CFD" OR '
-        '"wind turbine wake" OR "wind turbine structure" OR '
-        '"wind turbine blade" OR "wind resource assessment"'
-    )
+   
     translate_mode = os.environ.get("TRANSLATE_MODE", "true").lower() == "true"
 
     print("🚀 开始获取风电论文...")
-    papers_raw = fetch_papers(query, limit=MAX_PAPERS_TO_FETCH)
+    papers_raw = fetch_all_papers(SEARCH_QUERIES, limit_per_query=30, year_start="2024")
     if not papers_raw:
         send_email("今日未获取到风电论文，请检查脚本日志。")
         sys.exit(0)
