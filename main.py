@@ -10,6 +10,7 @@ from openai import OpenAI
 import os
 import sys
 
+
 # ---------- 配置 ----------
 SEMANTIC_SCHOLAR_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 OPENALEX_SOURCES_URL = "https://api.openalex.org/sources"
